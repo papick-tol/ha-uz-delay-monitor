@@ -3,6 +3,7 @@ import json
 import os
 import re
 import time
+import uuid
 from bs4 import BeautifulSoup
 import paho.mqtt.client as mqtt
 import requests
@@ -19,7 +20,16 @@ else:
 CHANNEL_USERNAME = str(config.get("channel_username", "UZprymisky")).lstrip("@")
 INTERVAL = int(config.get("check_interval_seconds", 30))
 TG_BOT_TOKEN = config.get("tg_bot_token", "").strip()
-TG_CHAT_IDS = config.get("tg_chat_ids", [])
+
+# Захист формату: обробка як списку, так і одиночного значення
+raw_chat_ids = config.get("tg_chat_ids", [])
+if isinstance(raw_chat_ids, int):
+    TG_CHAT_IDS = [raw_chat_ids]
+elif isinstance(raw_chat_ids, list):
+    TG_CHAT_IDS = raw_chat_ids
+else:
+    TG_CHAT_IDS = []
+
 TOPIC_PREFIX = config.get("mqtt_topic_prefix", "uz/train_delay").rstrip("/")
 
 TRAIN_SCHEDULES = {
@@ -42,16 +52,23 @@ TRAIN_PATTERN = (
     else None
 )
 
-mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+# Генерація унікального client_id для уникнення циклічних розривів сесії
+CLIENT_ID = f"uz_delay_monitor_{uuid.uuid4().hex[:8]}"
+mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=CLIENT_ID)
+
 if MQTT_USER and MQTT_PASSWORD:
     mqtt_client.username_pw_set(MQTT_USER, MQTT_PASSWORD)
 
 def on_connect(client, userdata, flags, rc, properties=None):
-    print("MQTT: Підключено успішно.", flush=True)
+    if rc == 0:
+        print("MQTT: Підключено успішно та стабільно.", flush=True)
+    else:
+        print(f"MQTT: Помилка підключення з кодом {rc}", flush=True)
 
 mqtt_client.on_connect = on_connect
+
 try:
-    mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
+    mqtt_client.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
     mqtt_client.loop_start()
 except Exception as e:
     print(f"MQTT помилка підключення: {e}", flush=True)
@@ -80,7 +97,8 @@ def send_telegram(text):
                 "text": text,
                 "disable_web_page_preview": True,
             }
-            requests.post(url, data=data, timeout=10)
+            # Таймаут збільшено до 25 секунд
+            requests.post(url, data=data, timeout=25)
         except Exception as e:
             print(f"Помилка відправки Telegram ({chat_id}): {e}", flush=True)
 
@@ -161,29 +179,40 @@ def fetch_channel_messages():
 def main():
     print(f"Запуск UZ Monitor для каналу @{CHANNEL_USERNAME}...", flush=True)
     last_id = load_last_id()
-    is_initial_run = (last_id == 0)
 
     while True:
         try:
             messages = fetch_channel_messages()
             if messages:
-                # Обробляємо повідомлення за порядком зростання ID
                 for msg in messages:
                     if msg["id"] > last_id:
                         trains_label, clean_message = extract_train_lines(msg["text"])
                         if trains_label:
                             print(f"Знайдено поїзд: {trains_label} (повідомлення #{msg['id']})", flush=True)
                             
-                            # При першому запуску перевіряємо історію, оновлюємо MQTT і надсилаємо сповіщення
+                            # Відправка сповіщення в Telegram
                             send_telegram(clean_message)
 
-                            mqtt_client.publish(MQTT_TOPIC_STATE, trains_label, retain=True)
-                            payload = {
-                                "train": trains_label,
-                                "message": clean_message,
-                                "date": msg["date"]
-                            }
-                            mqtt_client.publish(MQTT_TOPIC_ATTRS, json.dumps(payload, ensure_ascii=False), retain=True)
+                            # Гарантована публікація в MQTT з qos=1 та очікуванням доставки
+                            try:
+                                res_state = mqtt_client.publish(MQTT_TOPIC_STATE, trains_label, retain=True, qos=1)
+                                res_state.wait_for_publish(timeout=5)
+
+                                payload = {
+                                    "train": trains_label,
+                                    "message": clean_message,
+                                    "date": msg["date"]
+                                }
+                                res_attrs = mqtt_client.publish(
+                                    MQTT_TOPIC_ATTRS, 
+                                    json.dumps(payload, ensure_ascii=False), 
+                                    retain=True, 
+                                    qos=1
+                                )
+                                res_attrs.wait_for_publish(timeout=5)
+                                print(f"MQTT: Дані успішно зафіксовано в топіку {MQTT_TOPIC_STATE}", flush=True)
+                            except Exception as pub_err:
+                                print(f"Помилка відправки в MQTT: {pub_err}", flush=True)
 
                         last_id = max(last_id, msg["id"])
                         save_last_id(last_id)
