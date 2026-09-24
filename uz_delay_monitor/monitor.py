@@ -40,10 +40,10 @@ TRAIN_SCHEDULES = {
 MQTT_TOPIC_STATE = f"{TOPIC_PREFIX}/state"
 MQTT_TOPIC_ATTRS = f"{TOPIC_PREFIX}/attributes"
 
-MQTT_BROKER = os.getenv("MQTT_HOST", "core-mosquitto")
-MQTT_PORT = int(os.getenv("MQTT_PORT", 1883))
-MQTT_USER = os.getenv("MQTT_USER", "")
-MQTT_PASSWORD = os.getenv("MQTT_PASSWORD", "")
+MQTT_BROKER = config.get("mqtt_broker") or os.getenv("MQTT_HOST", "core-mosquitto")
+MQTT_PORT = int(config.get("mqtt_port") or os.getenv("MQTT_PORT", 1883))
+MQTT_USER = str(config.get("mqtt_user") or os.getenv("MQTT_USER", "")).strip()
+MQTT_PASSWORD = str(config.get("mqtt_password") or os.getenv("MQTT_PASSWORD", "")).strip()
 
 sorted_keys = sorted(TRAIN_SCHEDULES.keys(), key=len, reverse=True)
 TRAIN_PATTERN = (
