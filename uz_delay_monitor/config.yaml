@@ -17,10 +17,10 @@ schema:
   mqtt_port: int?
   mqtt_user: str?
   mqtt_password: password?
-  tg_bot_token: password
+  tg_bot_token: password?
   tg_chat_ids:
-    - int
-  mqtt_topic_prefix: str
+    - int?
+  mqtt_topic_prefix: str?
   train_schedules:
     - train_id: str
       schedule: str
