@@ -9,7 +9,7 @@ import paho.mqtt.client as mqtt
 import requests
 
 OPTIONS_FILE = "/data/options.json"
-STATE_STORAGE = "/data/last_seen_id.txt"
+STATE_STORAGE = "/data/last_delays.json"
 
 if os.path.exists(OPTIONS_FILE):
     with open(OPTIONS_FILE, "r", encoding="utf-8") as f:
@@ -17,11 +17,9 @@ if os.path.exists(OPTIONS_FILE):
 else:
     raise RuntimeError("Конфігураційний файл /data/options.json відсутній!")
 
-CHANNEL_USERNAME = str(config.get("channel_username", "UZprymisky")).lstrip("@")
-INTERVAL = int(config.get("check_interval_seconds", 30))
+INTERVAL = int(config.get("check_interval_seconds", 60))
 TG_BOT_TOKEN = config.get("tg_bot_token", "").strip()
 
-# Захист формату: обробка як списку, так і одиночного значення
 raw_chat_ids = config.get("tg_chat_ids", [])
 if isinstance(raw_chat_ids, int):
     TG_CHAT_IDS = [raw_chat_ids]
@@ -45,27 +43,28 @@ MQTT_PORT = int(config.get("mqtt_port") or os.getenv("MQTT_PORT", 1883))
 MQTT_USER = str(config.get("mqtt_user") or os.getenv("MQTT_USER", "")).strip()
 MQTT_PASSWORD = str(config.get("mqtt_password") or os.getenv("MQTT_PASSWORD", "")).strip()
 
-sorted_keys = sorted(TRAIN_SCHEDULES.keys(), key=len, reverse=True)
-TRAIN_PATTERN = (
-    re.compile(r"(" + "|".join([re.escape(x) for x in sorted_keys]) + r")")
-    if sorted_keys
-    else None
-)
-
-# Генерація унікального client_id для уникнення циклічних розривів сесії
 CLIENT_ID = f"uz_delay_monitor_{uuid.uuid4().hex[:8]}"
 mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=CLIENT_ID)
 
 if MQTT_USER and MQTT_PASSWORD:
     mqtt_client.username_pw_set(MQTT_USER, MQTT_PASSWORD)
 
+mqtt_connected = False
+
 def on_connect(client, userdata, flags, rc, properties=None):
+    global mqtt_connected
     if rc == 0:
-        print("MQTT: Підключено успішно та стабільно.", flush=True)
+        mqtt_connected = True
+        print("MQTT: Підключено успішно.", flush=True)
     else:
-        print(f"MQTT: Помилка підключення з кодом {rc}", flush=True)
+        print(f"MQTT: Помилка з'єднання (rc={rc})", flush=True)
+
+def on_disconnect(client, userdata, disconnect_flags, rc, properties=None):
+    global mqtt_connected
+    mqtt_connected = False
 
 mqtt_client.on_connect = on_connect
+mqtt_client.on_disconnect = on_disconnect
 
 try:
     mqtt_client.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
@@ -73,18 +72,11 @@ try:
 except Exception as e:
     print(f"MQTT помилка підключення: {e}", flush=True)
 
-def load_last_id():
-    if os.path.exists(STATE_STORAGE):
-        try:
-            with open(STATE_STORAGE, "r") as f:
-                return int(f.read().strip())
-        except Exception:
-            return 0
-    return 0
-
-def save_last_id(msg_id):
-    with open(STATE_STORAGE, "w") as f:
-        f.write(str(msg_id))
+# Очікуємо стабілізації підключення
+wait_cycles = 0
+while not mqtt_connected and wait_cycles < 20:
+    time.sleep(0.5)
+    wait_cycles += 1
 
 def send_telegram(text):
     if not TG_BOT_TOKEN or not TG_CHAT_IDS:
@@ -97,127 +89,148 @@ def send_telegram(text):
                 "text": text,
                 "disable_web_page_preview": True,
             }
-            # Таймаут збільшено до 25 секунд
             requests.post(url, data=data, timeout=25)
         except Exception as e:
             print(f"Помилка відправки Telegram ({chat_id}): {e}", flush=True)
 
-def format_line_with_schedule(line, train_id):
-    schedule = TRAIN_SCHEDULES.get(train_id, "").strip()
-    clean_line = line.replace("**", "").strip()
-
-    pattern = re.compile(rf"(№?\s*{re.escape(train_id)})\s+", re.IGNORECASE)
-    if pattern.search(clean_line):
-        clean_line = pattern.sub(r"\1\n", clean_line, count=1)
-
-    if schedule and "курсує" in clean_line:
-        clean_line = clean_line.replace("курсує", f"\n{schedule}\nкурсує", 1)
-    elif schedule:
-        clean_line = f"{clean_line}\n{schedule}"
-
-    return f"🚆 Укрзалізниця: Затримка\n{clean_line}"
-
-def extract_train_lines(full_text):
-    if not TRAIN_PATTERN:
-        return None, None
-    matched_lines = []
-    matched_trains = []
-
-    for raw_line in full_text.splitlines():
-        line = raw_line.strip()
-        match = TRAIN_PATTERN.search(line)
-        if match:
-            train_id = match.group(1)
-            matched_trains.append(train_id)
-            formatted_line = format_line_with_schedule(line, train_id)
-            matched_lines.append(formatted_line)
-
-    if matched_lines:
-        trains_label = ", ".join(dict.fromkeys(matched_trains))
-        clean_message = "\n".join(matched_lines)
-        return trains_label, clean_message
-    return None, None
-
-def fetch_channel_messages():
-    url = f"https://t.me/s/{CHANNEL_USERNAME}"
+def fetch_uz_vezemo_delays():
+    """
+    Завантажує та розбирає HTML-сторінку офіційного порталу suburban-delayform
+    """
+    url = "https://uz-vezemo.uz.gov.ua/suburban-delayform"
     headers = {
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "uk-UA,uk;q=0.9,en;q=0.8"
     }
-    resp = requests.get(url, headers=headers, timeout=15)
-    if resp.status_code != 200:
-        print(f"Не вдалося отримати сторінку каналу (HTTP {resp.status_code})", flush=True)
-        return []
+    
+    try:
+        resp = requests.get(url, headers=headers, timeout=20)
+        if resp.status_code != 200:
+            print(f"uz-vezemo повернув HTTP {resp.status_code}", flush=True)
+            return {}
+    except Exception as err:
+        print(f"Помилка запиту до uz-vezemo: {err}", flush=True)
+        return {}
 
     soup = BeautifulSoup(resp.text, "html.parser")
-    posts = soup.find_all("div", class_="tgme_widget_message")
-    results = []
+    page_text = soup.get_text(separator="\n")
+    
+    delays_found = {}
 
-    for post in posts:
-        post_id_attr = post.get("data-post")
-        if not post_id_attr:
-            continue
-        msg_id = int(post_id_attr.split("/")[-1])
+    # Шукаємо кожен поїзд із налаштованого списку
+    for train_id in TRAIN_SCHEDULES.keys():
+        escaped_id = re.escape(train_id)
+        # Шукаємо рядок виду: 6723 Миронівка → Київ-Пас ... +1:37
+        pattern = re.compile(
+            rf"(?:№?\s*{escaped_id})\s+([^\n\+]+?)\s*(\+\d+:\d+|\+\d+\s*хв|\d+\s*хв)",
+            re.IGNORECASE
+        )
+        match = pattern.search(page_text)
+        if match:
+            route = match.group(1).strip()
+            delay = match.group(2).strip()
+            delays_found[train_id] = {
+                "route": route,
+                "delay": delay
+            }
+            
+    return delays_found
 
-        text_block = post.find("div", class_="tgme_widget_message_text")
-        if not text_block:
-            continue
+def load_cached_delays():
+    if os.path.exists(STATE_STORAGE):
+        try:
+            with open(STATE_STORAGE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
 
-        for br in text_block.find_all("br"):
-            br.replace_with("\n")
-        plain_text = text_block.get_text()
-
-        time_tag = post.find("time")
-        date_str = time_tag.get("datetime") if time_tag else time.strftime("%Y-%m-%d %H:%M:%S")
-
-        results.append({
-            "id": msg_id,
-            "text": plain_text,
-            "date": date_str
-        })
-    return results
+def save_cached_delays(data):
+    with open(STATE_STORAGE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
 
 def main():
-    print(f"Запуск UZ Monitor для каналу @{CHANNEL_USERNAME}...", flush=True)
-    last_id = load_last_id()
+    print("Запуск моніторингу затримок через uz-vezemo.uz.gov.ua...", flush=True)
+    cached_delays = load_cached_delays()
 
     while True:
         try:
-            messages = fetch_channel_messages()
-            if messages:
-                for msg in messages:
-                    if msg["id"] > last_id:
-                        trains_label, clean_message = extract_train_lines(msg["text"])
-                        if trains_label:
-                            print(f"Знайдено поїзд: {trains_label} (повідомлення #{msg['id']})", flush=True)
-                            
-                            # Відправка сповіщення в Telegram
-                            send_telegram(clean_message)
+            current_delays = fetch_uz_vezemo_delays()
+            
+            # Якщо є виявлені затримки серед обраних рейсів
+            if current_delays:
+                active_trains = list(current_delays.keys())
+                primary_train = active_trains[0]
+                
+                # Перевіряємо, чи змінився статус або час затримки
+                has_updates = False
+                messages = []
+                
+                for t_id, info in current_delays.items():
+                    prev_info = cached_delays.get(t_id)
+                    schedule = TRAIN_SCHEDULES.get(t_id, "")
+                    
+                    # Формуємо текст сповіщення
+                    msg_body = (
+                        f"🚆 Укрзалізниця (онлайн-моніторинг):\n"
+                        f"Поїзд № {t_id} {info['route']}\n"
+                        f"🕒 Графік: {schedule}\n"
+                        f"⚠️ Затримка: {info['delay']}"
+                    )
+                    messages.append(msg_body)
+                    
+                    if not prev_info or prev_info.get("delay") != info["delay"]:
+                        has_updates = True
+                
+                full_message = "\n\n".join(messages)
 
-                            # Гарантована публікація в MQTT з qos=1 та очікуванням доставки
-                            try:
-                                res_state = mqtt_client.publish(MQTT_TOPIC_STATE, trains_label, retain=True, qos=1)
-                                res_state.wait_for_publish(timeout=5)
+                # Якщо є нове повідомлення або затримка збільшилась/зменшилась
+                if has_updates:
+                    print(f"Знайдено оновлення: {', '.join(active_trains)} -> {current_delays}", flush=True)
+                    send_telegram(full_message)
 
-                                payload = {
-                                    "train": trains_label,
-                                    "message": clean_message,
-                                    "date": msg["date"]
-                                }
-                                res_attrs = mqtt_client.publish(
-                                    MQTT_TOPIC_ATTRS, 
-                                    json.dumps(payload, ensure_ascii=False), 
-                                    retain=True, 
-                                    qos=1
-                                )
-                                res_attrs.wait_for_publish(timeout=5)
-                                print(f"MQTT: Дані успішно зафіксовано в топіку {MQTT_TOPIC_STATE}", flush=True)
-                            except Exception as pub_err:
-                                print(f"Помилка відправки в MQTT: {pub_err}", flush=True)
+                    # Публікація в MQTT
+                    try:
+                        res_state = mqtt_client.publish(
+                            MQTT_TOPIC_STATE, 
+                            ", ".join(active_trains), 
+                            retain=True, 
+                            qos=1
+                        )
+                        res_state.wait_for_publish(timeout=5)
 
-                        last_id = max(last_id, msg["id"])
-                        save_last_id(last_id)
+                        payload = {
+                            "trains": active_trains,
+                            "message": full_message,
+                            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                            "details": current_delays
+                        }
+                        res_attrs = mqtt_client.publish(
+                            MQTT_TOPIC_ATTRS, 
+                            json.dumps(payload, ensure_ascii=False), 
+                            retain=True, 
+                            qos=1
+                        )
+                        res_attrs.wait_for_publish(timeout=5)
+                        print(f"MQTT оновлено: {active_trains}", flush=True)
+                    except Exception as mqtt_err:
+                        print(f"Помилка публікації в MQTT: {mqtt_err}", flush=True)
+
+                cached_delays = current_delays
+                save_cached_delays(cached_delays)
+
+            else:
+                # Якщо раніше були затримки, а зараз сайт чистий (поїзди прибули)
+                if cached_delays:
+                    print("Затримок за вказаними рейсами немає. Скидання MQTT.", flush=True)
+                    mqtt_client.publish(MQTT_TOPIC_STATE, "none", retain=True, qos=1)
+                    mqtt_client.publish(MQTT_TOPIC_ATTRS, "{}", retain=True, qos=1)
+                    cached_delays = {}
+                    save_cached_delays(cached_delays)
+
         except Exception as e:
-            print(f"Помилка в циклі опитування: {e}", flush=True)
+            print(f"Помилка в ітерації моніторингу: {e}", flush=True)
 
         time.sleep(INTERVAL)
 
