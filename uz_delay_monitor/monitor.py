@@ -167,7 +167,7 @@ def check_telegram():
 
 def check_uz_vezemo():
     """
-    Опитування офіційного табло uz-vezemo.uz.gov.ua/suburban-delayform
+    Парсинг официального табло uz-vezemo по структуре tr.delay-row
     """
     if not TRAIN_SCHEDULES:
         return {}
@@ -180,25 +180,48 @@ def check_uz_vezemo():
             return {}
 
         soup = BeautifulSoup(resp.text, "html.parser")
-        page_text = soup.get_text(separator="\n")
+        
+        # Находим все строки поездов таблицы
+        rows = soup.find_all("tr", class_=lambda c: c and "delay-row" in c)
 
-        for train_id in TRAIN_SCHEDULES.keys():
-            escaped_id = re.escape(train_id)
-            pattern = re.compile(
-                rf"(?:№?\s*{escaped_id})\s+([^\n\+]+?)\s*(\+\d+:\d+|\+\d+\s*хв|\d+\s*хв)",
-                re.IGNORECASE,
-            )
-            match = pattern.search(page_text)
-            if match:
-                route = match.group(1).strip()
-                delay = match.group(2).strip()
-                line = f"{train_id} {route} затримка {delay}"
-                formatted = format_train_message(line, train_id)
-                results[train_id] = {
+        for row in rows:
+            num_tag = row.find(class_="js-delay-train-number")
+            if not num_tag:
+                continue
+
+            train_num = num_tag.get_text().strip()
+            data_search = num_tag.get("data-search", "")
+
+            # Проверяем, есть ли этот поезд в списке отслеживаемых
+            matched_id = None
+            for my_id in TRAIN_SCHEDULES.keys():
+                if my_id == train_num or my_id in data_search:
+                    matched_id = my_id
+                    break
+
+            if matched_id:
+                # Извлекаем маршрут
+                conn_tag = row.find(class_=lambda c: c and "js-delay-connections" in c)
+                route = " ".join(conn_tag.get_text().split()) if conn_tag else ""
+
+                # Извлекаем весь текст строки для поиска времени задержки
+                row_text = " ".join(row.get_text().split())
+                delay_match = re.search(r"(\+\d+:\d+|\+\d+\s*хв|\d+\s*хв)", row_text)
+                delay_val = delay_match.group(1) if delay_match else "затримка"
+
+                # Формируем строку и сообщение
+                if route:
+                    line = f"{matched_id} {route} затримка {delay_val}"
+                else:
+                    line = f"{matched_id} затримка {delay_val}"
+
+                formatted = format_train_message(line, matched_id)
+
+                results[matched_id] = {
                     "source": "uz-vezemo",
-                    "raw": line,
-                    "delay": delay,
-                    "message": formatted,
+                    "raw": f"{matched_id} {delay_val}",
+                    "delay": delay_val,
+                    "message": formatted
                 }
     except Exception as e:
         log(f"Помилка опитування uz-vezemo: {e}")
