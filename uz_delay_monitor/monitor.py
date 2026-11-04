@@ -4,6 +4,7 @@ import os
 import re
 import time
 import uuid
+from datetime import datetime
 from bs4 import BeautifulSoup
 import paho.mqtt.client as mqtt
 import requests
@@ -11,10 +12,18 @@ import requests
 OPTIONS_FILE = "/data/options.json"
 STATE_FILE = "/data/last_delays.json"
 
+def log(msg):
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{now}] {msg}", flush=True)
+
 # Завантаження конфігурації з Home Assistant
 if os.path.exists(OPTIONS_FILE):
-    with open(OPTIONS_FILE, "r", encoding="utf-8") as f:
-        config = json.load(f)
+    try:
+        with open(OPTIONS_FILE, "r", encoding="utf-8") as f:
+            config = json.load(f)
+    except Exception as e:
+        log(f"Помилка читання {OPTIONS_FILE}: {e}")
+        config = {}
 else:
     config = {}
 
@@ -54,20 +63,18 @@ if MQTT_USER and MQTT_PASSWORD:
 
 mqtt_connected = False
 
-
 def on_connect(client, userdata, flags, rc, properties=None):
     global mqtt_connected
     if rc == 0:
         mqtt_connected = True
-        print("MQTT: Підключено успішно.", flush=True)
+        log("MQTT: Підключено успішно.")
     else:
-        print(f"MQTT: Помилка з'єднання (rc={rc})", flush=True)
-
+        log(f"MQTT: Помилка з'єднання (rc={rc})")
 
 def on_disconnect(client, userdata, disconnect_flags, rc, properties=None):
     global mqtt_connected
     mqtt_connected = False
-
+    log(f"MQTT: Відключено (rc={rc})")
 
 mqtt_client.on_connect = on_connect
 mqtt_client.on_disconnect = on_disconnect
@@ -76,7 +83,7 @@ try:
     mqtt_client.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
     mqtt_client.loop_start()
 except Exception as e:
-    print(f"MQTT помилка підключення: {e}", flush=True)
+    log(f"MQTT помилка підключення: {e}")
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -84,8 +91,7 @@ HEADERS = {
     "Accept-Language": "uk-UA,uk;q=0.9,en;q=0.8",
 }
 
-
-def format_train_message(line, train_id, delay_val=None):
+def format_train_message(line, train_id):
     """
     Форматує рядок затримки під рідне оформлення Telegram сповіщень
     """
@@ -93,46 +99,55 @@ def format_train_message(line, train_id, delay_val=None):
     clean_line = line.replace("**", "").strip()
     clean_line = re.sub(r"^[🚊🚆➡️\s]+", "", clean_line)
 
-    # Якщо рядок зі старого/нового телеграму зі словом затримка або курсує
     if schedule:
         if "затримка" in clean_line.lower():
-            parts = re.split(
-                r"(затримка)", clean_line, flags=re.IGNORECASE, maxsplit=1
-            )
+            parts = re.split(r"(затримка)", clean_line, flags=re.IGNORECASE, maxsplit=1)
             clean_line = f"{parts[0].strip()}\n🕒 Графік: {schedule}\n⚠️ {parts[1]} {parts[2].strip()}"
         elif "курсує" in clean_line.lower():
-            clean_line = clean_line.replace(
-                "курсує", f"\n🕒 Графік: {schedule}\nкурсує", 1
-            )
+            clean_line = clean_line.replace("курсує", f"\n🕒 Графік: {schedule}\nкурсує", 1)
         else:
             clean_line = f"{clean_line}\n🕒 Графік: {schedule}"
 
     return f"🚆 Укрзалізниця: Затримка\n{clean_line}"
 
-
 def check_telegram():
     """
-    Опитування публічного веб-дзеркала каналу @UZprymisky
+    Опитування публічного веб-дзеркала каналу @UZprymisky (глибина до 15 повідомлень)
     """
     if not TRAIN_PATTERN:
         return {}
 
     url = "https://t.me/s/UZprymisky"
     results = {}
+    today_str = datetime.now().strftime("%Y-%m-%d")
+
     try:
         resp = requests.get(url, headers=HEADERS, timeout=15)
         if resp.status_code != 200:
             return {}
 
         soup = BeautifulSoup(resp.text, "html.parser")
-        messages = soup.find_all("div", class_="tgme_widget_message_text")
-        if not messages:
+        # Знаходимо всі контейнери повідомлень каналу
+        message_wrappers = soup.find_all("div", class_="tgme_widget_message_wrap")
+        if not message_wrappers:
             return {}
 
-        # Беремо останні 3 повідомлення для надійності
-        recent_posts = messages[-3:]
-        for post in reversed(recent_posts):
-            text = post.get_text(separator="\n")
+        # Беремо останні 15 повідомлень (або всі, якщо їх менше)
+        recent_wrappers = message_wrappers[-15:]
+
+        for wrap in reversed(recent_wrappers):
+            # Перевіряємо дату посту, щоб не читати вчорашні повідомлення
+            time_tag = wrap.find("time")
+            if time_tag and time_tag.has_attr("datetime"):
+                post_date = time_tag["datetime"][:10]
+                if post_date != today_str:
+                    continue
+
+            text_block = wrap.find("div", class_="tgme_widget_message_text")
+            if not text_block:
+                continue
+
+            text = text_block.get_text(separator="\n")
             for raw_line in text.splitlines():
                 line = raw_line.strip()
                 match = TRAIN_PATTERN.search(line)
@@ -146,10 +161,9 @@ def check_telegram():
                             "message": formatted,
                         }
     except Exception as e:
-        print(f"Помилка опитування Telegram: {e}", flush=True)
+        log(f"Помилка опитування Telegram: {e}")
 
     return results
-
 
 def check_uz_vezemo():
     """
@@ -187,10 +201,9 @@ def check_uz_vezemo():
                     "message": formatted,
                 }
     except Exception as e:
-        print(f"Помилка опитування uz-vezemo: {e}", flush=True)
+        log(f"Помилка опитування uz-vezemo: {e}")
 
     return results
-
 
 def load_state():
     if os.path.exists(STATE_FILE):
@@ -201,60 +214,54 @@ def load_state():
             return {}
     return {}
 
-
 def save_state(state):
     try:
         with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False)
     except Exception as e:
-        print(f"Не вдалося зберегти стан: {e}", flush=True)
-
+        log(f"Не вдалося зберегти стан: {e}")
 
 def main():
-    print(
-        "Запуск гібридного UZ Monitor (Telegram Web + uz-vezemo)...", flush=True
-    )
+    log("Запуск гібридного UZ Monitor (Telegram Web + uz-vezemo)...")
     last_state = load_state()
+    empty_checks_count = 0  # лічильник порожніх перевірок для захисту від випадкового скидання
 
     while True:
         try:
-            # 1. Опитуємо обидва джерела
             tg_delays = check_telegram()
             web_delays = check_uz_vezemo()
 
-            # Об'єднуємо результати (сайт uz-vezemo має перевагу щодо точності часу затримки)
             combined_delays = {}
             combined_delays.update(tg_delays)
             combined_delays.update(web_delays)
 
             if combined_delays:
+                empty_checks_count = 0
                 active_trains = list(combined_delays.keys())
                 messages = [v["message"] for v in combined_delays.values()]
                 full_message = "\n\n".join(messages)
 
-                # Перевіряємо, чи змінився склад рейсів або текст
                 has_changed = False
-                for t_id, data in combined_delays.items():
-                    if (
-                        t_id not in last_state
-                        or last_state[t_id].get("raw") != data.get("raw")
-                    ):
-                        has_changed = True
-                        break
+                # Перевіряємо зміну складу поїздів або тексту затримок
+                if set(active_trains) != set(last_state.keys()):
+                    has_changed = True
+                else:
+                    for t_id, data in combined_delays.items():
+                        if last_state.get(t_id, {}).get("raw") != data.get("raw"):
+                            has_changed = True
+                            break
 
                 if has_changed:
                     state_val = ", ".join(active_trains)
                     payload = {
                         "trains": active_trains,
                         "message": full_message,
-                        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                         "details": combined_delays,
                     }
 
-                    print(f"Публікація в MQTT: {state_val}", flush=True)
-                    mqtt_client.publish(
-                        MQTT_TOPIC_STATE, state_val, retain=True, qos=1
-                    )
+                    log(f"Публікація в MQTT: {state_val}")
+                    mqtt_client.publish(MQTT_TOPIC_STATE, state_val, retain=True, qos=1)
                     mqtt_client.publish(
                         MQTT_TOPIC_ATTRS,
                         json.dumps(payload, ensure_ascii=False),
@@ -266,26 +273,23 @@ def main():
                     save_state(last_state)
 
             else:
-                # Якщо затримок немає, але раніше були — скидаємо сенсор
+                # Якщо поїздів немає, скидаємо стан лише після 2 підтверджених порожніх циклів
                 if last_state:
-                    print(
-                        "Затримок немає. Скидання MQTT сенсора в 'none'.",
-                        flush=True,
-                    )
-                    mqtt_client.publish(
-                        MQTT_TOPIC_STATE, "none", retain=True, qos=1
-                    )
-                    mqtt_client.publish(
-                        MQTT_TOPIC_ATTRS, "{}", retain=True, qos=1
-                    )
-                    last_state = {}
-                    save_state(last_state)
+                    empty_checks_count += 1
+                    if empty_checks_count >= 2:
+                        log("Затримок немає (підтверджено). Скидання MQTT сенсора в 'none'.")
+                        mqtt_client.publish(MQTT_TOPIC_STATE, "none", retain=True, qos=1)
+                        mqtt_client.publish(MQTT_TOPIC_ATTRS, "{}", retain=True, qos=1)
+                        last_state = {}
+                        save_state(last_state)
+                        empty_checks_count = 0
+                    else:
+                        log("Дані відсутні в поточному запиті, очікування підтвердження...")
 
         except Exception as e:
-            print(f"Помилка головного циклу: {e}", flush=True)
+            log(f"Помилка головного циклу: {e}")
 
         time.sleep(INTERVAL)
-
 
 if __name__ == "__main__":
     main()
