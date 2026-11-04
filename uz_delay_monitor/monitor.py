@@ -93,7 +93,7 @@ HEADERS = {
 
 def format_train_message(line, train_id):
     """
-    Форматує рядок затримки під рідне оформлення Telegram сповіщень
+    Форматує рядок під звичний вигляд Telegram сповіщення
     """
     schedule = TRAIN_SCHEDULES.get(train_id, "").strip()
     clean_line = line.replace("**", "").strip()
@@ -110,64 +110,9 @@ def format_train_message(line, train_id):
 
     return f"🚆 Укрзалізниця: Затримка\n{clean_line}"
 
-def check_telegram():
-    """
-    Опитування публічного веб-дзеркала каналу @UZprymisky (глибина до 15 повідомлень)
-    """
-    if not TRAIN_PATTERN:
-        return {}
-
-    url = "https://t.me/s/UZprymisky"
-    results = {}
-    today_str = datetime.now().strftime("%Y-%m-%d")
-
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=15)
-        if resp.status_code != 200:
-            return {}
-
-        soup = BeautifulSoup(resp.text, "html.parser")
-        # Знаходимо всі контейнери повідомлень каналу
-        message_wrappers = soup.find_all("div", class_="tgme_widget_message_wrap")
-        if not message_wrappers:
-            return {}
-
-        # Беремо останні 15 повідомлень (або всі, якщо їх менше)
-        recent_wrappers = message_wrappers[-15:]
-
-        for wrap in reversed(recent_wrappers):
-            # Перевіряємо дату посту, щоб не читати вчорашні повідомлення
-            time_tag = wrap.find("time")
-            if time_tag and time_tag.has_attr("datetime"):
-                post_date = time_tag["datetime"][:10]
-                if post_date != today_str:
-                    continue
-
-            text_block = wrap.find("div", class_="tgme_widget_message_text")
-            if not text_block:
-                continue
-
-            text = text_block.get_text(separator="\n")
-            for raw_line in text.splitlines():
-                line = raw_line.strip()
-                match = TRAIN_PATTERN.search(line)
-                if match:
-                    train_id = match.group(1)
-                    if train_id not in results:
-                        formatted = format_train_message(line, train_id)
-                        results[train_id] = {
-                            "source": "telegram",
-                            "raw": line,
-                            "message": formatted,
-                        }
-    except Exception as e:
-        log(f"Помилка опитування Telegram: {e}")
-
-    return results
-
 def check_uz_vezemo():
     """
-    Парсинг официального табло uz-vezemo по структуре tr.delay-row
+    Опитування офіційного табло uz-vezemo за структурою tr.delay-row
     """
     if not TRAIN_SCHEDULES:
         return {}
@@ -180,8 +125,6 @@ def check_uz_vezemo():
             return {}
 
         soup = BeautifulSoup(resp.text, "html.parser")
-        
-        # Находим все строки поездов таблицы
         rows = soup.find_all("tr", class_=lambda c: c and "delay-row" in c)
 
         for row in rows:
@@ -192,7 +135,6 @@ def check_uz_vezemo():
             train_num = num_tag.get_text().strip()
             data_search = num_tag.get("data-search", "")
 
-            # Проверяем, есть ли этот поезд в списке отслеживаемых
             matched_id = None
             for my_id in TRAIN_SCHEDULES.keys():
                 if my_id == train_num or my_id in data_search:
@@ -200,16 +142,13 @@ def check_uz_vezemo():
                     break
 
             if matched_id:
-                # Извлекаем маршрут
                 conn_tag = row.find(class_=lambda c: c and "js-delay-connections" in c)
                 route = " ".join(conn_tag.get_text().split()) if conn_tag else ""
 
-                # Извлекаем весь текст строки для поиска времени задержки
                 row_text = " ".join(row.get_text().split())
                 delay_match = re.search(r"(\+\d+:\d+|\+\d+\s*хв|\d+\s*хв)", row_text)
                 delay_val = delay_match.group(1) if delay_match else "затримка"
 
-                # Формируем строку и сообщение
                 if route:
                     line = f"{matched_id} {route} затримка {delay_val}"
                 else:
@@ -225,6 +164,46 @@ def check_uz_vezemo():
                 }
     except Exception as e:
         log(f"Помилка опитування uz-vezemo: {e}")
+
+    return results
+
+def check_telegram():
+    """
+    Опитування публічного веб-дзеркала каналу @UZprymisky (від найновіших до старіших)
+    """
+    if not TRAIN_PATTERN:
+        return {}
+
+    url = "https://t.me/s/UZprymisky"
+    results = {}
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=15)
+        if resp.status_code != 200:
+            return {}
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+        messages = soup.find_all("div", class_="tgme_widget_message_text")
+        if not messages:
+            return {}
+
+        # Беремо останні 15 повідомлень, ідемо від найновішого до старіших
+        recent_posts = list(reversed(messages[-15:]))
+        for post in recent_posts:
+            text = post.get_text(separator="\n")
+            for raw_line in text.splitlines():
+                line = raw_line.strip()
+                match = TRAIN_PATTERN.search(line)
+                if match:
+                    train_id = match.group(1)
+                    if train_id not in results:
+                        formatted = format_train_message(line, train_id)
+                        results[train_id] = {
+                            "source": "telegram",
+                            "raw": line,
+                            "message": formatted
+                        }
+    except Exception as e:
+        log(f"Помилка опитування Telegram: {e}")
 
     return results
 
@@ -247,13 +226,15 @@ def save_state(state):
 def main():
     log("Запуск гібридного UZ Monitor (Telegram Web + uz-vezemo)...")
     last_state = load_state()
-    empty_checks_count = 0  # лічильник порожніх перевірок для захисту від випадкового скидання
+    empty_checks_count = 0
 
     while True:
         try:
+            # Опитуємо обидва джерела
             tg_delays = check_telegram()
             web_delays = check_uz_vezemo()
 
+            # Об'єднуємо (дані з сайту мають пріоритет, оскільки містять фактичну затримку)
             combined_delays = {}
             combined_delays.update(tg_delays)
             combined_delays.update(web_delays)
@@ -265,7 +246,6 @@ def main():
                 full_message = "\n\n".join(messages)
 
                 has_changed = False
-                # Перевіряємо зміну складу поїздів або тексту затримок
                 if set(active_trains) != set(last_state.keys()):
                     has_changed = True
                 else:
@@ -280,34 +260,34 @@ def main():
                         "trains": active_trains,
                         "message": full_message,
                         "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        "details": combined_delays,
+                        "details": combined_delays
                     }
 
                     log(f"Публікація в MQTT: {state_val}")
-                    mqtt_client.publish(MQTT_TOPIC_STATE, state_val, retain=True, qos=1)
+                    # Спочатку публікуємо attributes, потім state:
                     mqtt_client.publish(
                         MQTT_TOPIC_ATTRS,
                         json.dumps(payload, ensure_ascii=False),
                         retain=True,
-                        qos=1,
+                        qos=1
                     )
+                    mqtt_client.publish(MQTT_TOPIC_STATE, state_val, retain=True, qos=1)
 
                     last_state = combined_delays
                     save_state(last_state)
 
             else:
-                # Якщо поїздів немає, скидаємо стан лише після 2 підтверджених порожніх циклів
                 if last_state:
                     empty_checks_count += 1
                     if empty_checks_count >= 2:
-                        log("Затримок немає (підтверджено). Скидання MQTT сенсора в 'none'.")
-                        mqtt_client.publish(MQTT_TOPIC_STATE, "none", retain=True, qos=1)
+                        log("Затримок більше немає (підтверджено). Скидання MQTT сенсора в 'none'.")
                         mqtt_client.publish(MQTT_TOPIC_ATTRS, "{}", retain=True, qos=1)
+                        mqtt_client.publish(MQTT_TOPIC_STATE, "none", retain=True, qos=1)
                         last_state = {}
                         save_state(last_state)
                         empty_checks_count = 0
                     else:
-                        log("Дані відсутні в поточному запиті, очікування підтвердження...")
+                        log("Дані відсутні у поточному запиті, очікування підтвердження...")
 
         except Exception as e:
             log(f"Помилка головного циклу: {e}")
