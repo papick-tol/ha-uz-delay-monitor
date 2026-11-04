@@ -12,6 +12,7 @@ arch:
 
 startup: application
 boot: auto
+host_network: true
 
 options:
   channel_username: "UZprymisky"
