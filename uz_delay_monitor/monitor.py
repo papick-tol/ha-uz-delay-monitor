@@ -255,7 +255,7 @@ def main():
                             break
 
                 if has_changed:
-                    state_val = ", ".join(active_trains)
+                    state_val = ", ".join([f"{t_id} ({data.get('delay', '')})" for t_id, data in combined_delays.items()])
                     payload = {
                         "trains": active_trains,
                         "message": full_message,
