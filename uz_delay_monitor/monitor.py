@@ -4,7 +4,7 @@ import os
 import re
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from bs4 import BeautifulSoup
 import paho.mqtt.client as mqtt
 import requests
@@ -90,21 +90,72 @@ HEADERS = {
     "Accept-Language": "uk-UA,uk;q=0.9,en;q=0.8",
 }
 
-def format_train_message(line, train_id):
+def is_train_relevant(train_id):
+    """
+    Перевіряє, чи рейс ще актуальний за часом.
+    Якщо плановий час прибуття минув понад 90 хвилин тому — рейс вважається завершеним.
+    """
+    schedule = TRAIN_SCHEDULES.get(train_id, "").strip()
+    if not schedule:
+        return True
+
+    # Парсимо час у форматі "8:44 -> 10:00" або "08:44-10:00"
+    times = re.findall(r"(\d{1,2}:\d{2})", schedule)
+    if len(times) < 2:
+        return True
+
+    try:
+        now = datetime.now()
+        dep_str, arr_str = times[0], times[1]
+
+        dep_dt = datetime.strptime(dep_str, "%H:%M").replace(year=now.year, month=now.month, day=now.day)
+        arr_dt = datetime.strptime(arr_str, "%H:%M").replace(year=now.year, month=now.month, day=now.day)
+
+        # Якщо рейс нічний (прибуття наступного дня)
+        if arr_dt < dep_dt:
+            arr_dt += timedelta(days=1)
+
+        # Дозволяємо публікувати до 90 хв після планового прибуття
+        expiration_time = arr_dt + timedelta(minutes=90)
+
+        # Якщо зараз сильно пізніше часу прибуття або ще зарано (більше ніж за 2 години до відправки)
+        if now > expiration_time:
+            return False
+
+        earliest_monitoring_time = dep_dt - timedelta(hours=2)
+        if now < earliest_monitoring_time:
+            return False
+
+        return True
+    except Exception as e:
+        log(f"Помилка перевірки графіка для {train_id}: {e}")
+        return True
+
+def format_train_message(line, train_id, delay_val=None):
     schedule = TRAIN_SCHEDULES.get(train_id, "").strip()
     clean_line = line.replace("**", "").strip()
     clean_line = re.sub(r"^[🚊🚆➡️\s]+", "", clean_line)
 
-    if schedule:
-        if "затримка" in clean_line.lower():
-            parts = re.split(r"(затримка)", clean_line, flags=re.IGNORECASE, maxsplit=1)
-            clean_line = f"{parts[0].strip()}\n🕒 Графік: {schedule}\n⚠️ {parts[1]} {parts[2].strip()}"
-        elif "курсує" in clean_line.lower():
-            clean_line = clean_line.replace("курсує", f"\n🕒 Графік: {schedule}\nкурсує", 1)
-        else:
-            clean_line = f"{clean_line}\n🕒 Графік: {schedule}"
+    # Видаляємо старі хвости про затримку, щоб сформувати стандартний блок
+    clean_route = re.sub(r"\s*(затримка|курсує).*$", "", clean_line, flags=re.IGNORECASE).strip()
 
-    return f"🚆 Укрзалізниця: Затримка\n{clean_line}"
+    if delay_val:
+        d_str = str(delay_val).strip()
+        if d_str in ["0", "+0:00", "0:00", "+0", "None", ""]:
+            delay_line = "⚠️ затримка: час уточнюється"
+        else:
+            delay_line = f"⚠️ затримка {d_str if d_str.startswith('+') else '+' + d_str}"
+    else:
+        # Шукаємо в тексті рядка
+        delay_match = re.search(r"затримка\s*([\+\d\:\w\s]+)", clean_line, re.IGNORECASE)
+        if delay_match:
+            val = delay_match.group(1).strip()
+            delay_line = f"⚠️ затримка {val}"
+        else:
+            delay_line = "⚠️ затримка: час уточнюється"
+
+    sched_block = f"\n🕒 Графік: {schedule}" if schedule else ""
+    return f"🚆 Укрзалізниця: Затримка\n{clean_route}{sched_block}\n{delay_line}"
 
 def check_uz_vezemo():
     if not TRAIN_SCHEDULES:
@@ -136,23 +187,27 @@ def check_uz_vezemo():
                     break
 
             if matched_id:
+                # Перевіряємо, чи актуальний рейс за часом
+                if not is_train_relevant(matched_id):
+                    continue
+
                 conn_tag = row.find(class_=lambda c: c and "js-delay-connections" in c)
                 route = " ".join(conn_tag.get_text().split()) if conn_tag else ""
                 row_text = " ".join(row.get_text().split())
 
-                # Шукаємо явну затримку з плюсом або хвилинами (відкидаємо "0" та "-")
+                # Шукаємо час затримки
                 delay_match = re.search(r"(\+\s*\d+:\d+|\+\s*\d+\s*хв|\d+\s*хв)", row_text)
-                if not delay_match:
-                    continue
-
-                delay_val = delay_match.group(1).replace(" ", "")
+                if delay_match:
+                    delay_val = delay_match.group(1).replace(" ", "")
+                else:
+                    delay_val = "час уточнюється"
 
                 if route:
-                    line = f"{matched_id} {route} затримка {delay_val}"
+                    line = f"{matched_id} {route}"
                 else:
-                    line = f"{matched_id} затримка {delay_val}"
+                    line = f"{matched_id}"
 
-                formatted = format_train_message(line, matched_id)
+                formatted = format_train_message(line, matched_id, delay_val)
 
                 results[matched_id] = {
                     "source": "uz-vezemo",
@@ -189,11 +244,21 @@ def check_telegram():
                 match = TRAIN_PATTERN.search(line)
                 if match:
                     train_id = match.group(1)
+
+                    # Перевіряємо за часом розкладу
+                    if not is_train_relevant(train_id):
+                        continue
+
                     if train_id not in results:
-                        formatted = format_train_message(line, train_id)
+                        # Спробуємо витягнути затримку з рядка TG
+                        delay_match = re.search(r"(\+\s*\d+:\d+|\+\s*\d+\s*хв|\d+\s*хв)", line)
+                        delay_val = delay_match.group(1).replace(" ", "") if delay_match else "час уточнюється"
+
+                        formatted = format_train_message(line, train_id, delay_val)
                         results[train_id] = {
                             "source": "telegram",
-                            "raw": line,
+                            "raw": f"{train_id} {delay_val}",
+                            "delay": delay_val,
                             "message": formatted
                         }
     except Exception as e:
@@ -228,10 +293,10 @@ def main():
             web_delays = check_uz_vezemo()
 
             combined_delays = {}
+            # Веб має пріоритет над Telegram щодо точності часу затримки
             combined_delays.update(tg_delays)
             combined_delays.update(web_delays)
 
-            # Виводимо діагностику в лог при кожному опитуванні
             found_info = []
             if web_delays:
                 found_info.append(f"Web: {list(web_delays.keys())}")
@@ -241,7 +306,7 @@ def main():
             if found_info:
                 log(f"Знайдено затримки -> {', '.join(found_info)}")
             else:
-                log("Опитування завершено: затримок по списку не виявлено.")
+                log("Опитування завершено: актуальних затримок не виявлено.")
 
             if combined_delays:
                 empty_checks_count = 0
@@ -249,9 +314,9 @@ def main():
                 messages = [v["message"] for v in combined_delays.values()]
                 full_message = "\n\n".join(messages)
 
-                # Стан включає номер і затримку, щоб тригерити при зміні часу
                 state_val = ", ".join([f"{t_id} ({data.get('delay', 'затримка')})" for t_id, data in combined_delays.items()])
 
+                # Перевіряємо, чи змінився склад поїздів або значення затримки
                 has_changed = False
                 if set(active_trains) != set(last_state.keys()):
                     has_changed = True
