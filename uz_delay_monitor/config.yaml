@@ -1,6 +1,6 @@
 name: "UZ Train Delay Monitor"
 description: "Моніторинг затримок приміських поїздів УЗ"
-version: "1.0.4"
+version: "1.0.3"
 slug: "uz_delay_monitor"
 init: false
 arch:
