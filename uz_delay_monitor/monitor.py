@@ -116,7 +116,7 @@ def is_train_relevant(train_id):
             arr_dt += timedelta(days=1)
 
         # Дозволяємо публікувати до 90 хв після планового прибуття
-        expiration_time = arr_dt + timedelta(minutes=90)
+        expiration_time = arr_dt + timedelta(minutes=120)
 
         # Якщо зараз сильно пізніше часу прибуття або ще зарано (більше ніж за 2 години до відправки)
         if now > expiration_time:
