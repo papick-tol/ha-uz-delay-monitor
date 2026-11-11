@@ -1,4 +1,15 @@
-version: "1.0.7"
+name: "UZ Train Delay Monitor"
+slug: "uz_train_delay"
+description: "Моніторинг затримок поїздів УЗ"
+version: "1.0.6"
+slug: "uz_train_delay"
+arch:
+  - aarch64
+  - amd64
+  - armhf
+  - armv7
+  - i386
+
 schema:
   channel_username: str
   check_interval_seconds: int
@@ -7,14 +18,14 @@ schema:
   mqtt_user: str?
   mqtt_password: password?
   mqtt_topic_prefix: str
-  train_schedules:
-    - train_id: str
-      schedule: str
   min_delay_minutes: int?
   ignored_keywords:
     - str
   allowed_keywords:
     - str
+  train_schedules:
+    - train_id: str
+      schedule: str
 
 options:
   channel_username: "UZprymisky"
