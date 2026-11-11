@@ -1,37 +1,4 @@
-name: "UZ Train Delay Monitor"
-description: "Моніторинг затримок приміських поїздів УЗ"
-version: "1.0.6"
-slug: "uz_delay_monitor"
-init: false
-arch:
-  - aarch64
-  - amd64
-  - armhf
-  - armv7
-  - i386
-
-startup: application
-boot: auto
-host_network: true
-
-options:
-  channel_username: "UZprymisky"
-  check_interval_seconds: 30
-  mqtt_broker: "core-mosquitto"
-  mqtt_port: 1883
-  mqtt_user: ""
-  mqtt_password: ""
-  mqtt_topic_prefix: "uz/train_delay"
-  train_schedules:
-    - train_id: "6702/6701"
-      schedule: "8:44 -> 10:00"
-    - train_id: "6704/6703"
-      schedule: "12:52 -> 13:43"
-    - train_id: "6705"
-      schedule: "17:44 -> 19:40"
-    - train_id: "6723"
-      schedule: "17:10 -> 19:05"
-
+version: "1.0.7"
 schema:
   channel_username: str
   check_interval_seconds: int
@@ -43,3 +10,46 @@ schema:
   train_schedules:
     - train_id: str
       schedule: str
+  min_delay_minutes: int?
+  ignored_keywords:
+    - str
+  allowed_keywords:
+    - str
+
+options:
+  channel_username: "UZprymisky"
+  check_interval_seconds: 60
+  mqtt_broker: "core-mosquitto"
+  mqtt_port: 1883
+  mqtt_user: "papick"
+  mqtt_password: ""
+  mqtt_topic_prefix: "uz/train_delay"
+  min_delay_minutes: 5
+  ignored_keywords:
+    - "харків"
+    - "зміїв"
+    - "люботин"
+    - "полтава"
+    - "дніпро"
+    - "львів"
+    - "одеса"
+  allowed_keywords:
+    - "київ"
+    - "миронівка"
+    - "трипілля"
+    - "ніжин"
+    - "дарниця"
+    - "фастів"
+  train_schedules:
+    - train_id: "6701"
+      schedule: "8:44 -> 10:00"
+    - train_id: "6703"
+      schedule: "12:52 -> 13:43"
+    - train_id: "6705"
+      schedule: "18:13 -> 19:05"
+    - train_id: "6721"
+      schedule: "6:00 -> 7:14"
+    - train_id: "6723"
+      schedule: "9:34 -> 10:35"
+    - train_id: "6725"
+      schedule: "16:21 -> 17:38"
