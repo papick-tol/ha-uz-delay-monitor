@@ -2,7 +2,6 @@ name: "UZ Train Delay Monitor"
 slug: "uz_train_delay"
 description: "Моніторинг затримок поїздів УЗ"
 version: "1.0.8"
-slug: "uz_train_delay"
 arch:
   - aarch64
   - amd64
